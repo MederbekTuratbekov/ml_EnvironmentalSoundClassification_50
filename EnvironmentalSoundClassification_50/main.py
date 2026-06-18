@@ -1,17 +1,17 @@
 import io
 import torch
 import uvicorn
+import numpy as np
 import torch.nn as nn
 import soundfile as sf
-import streamlit as st
 import torch.nn.functional as F
+import streamlit as st
 from torchaudio import transforms
 from fastapi import FastAPI, HTTPException, UploadFile, File
 
 
-
 class SimpleCNN(nn.Module):
-    def __init__(self,):
+    def __init__(self):
         super().__init__()
         self.first = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=3, padding=1),
@@ -29,57 +29,72 @@ class SimpleCNN(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 50)
         )
+
     def forward(self, audio):
         audio = audio.unsqueeze(1)
         audio = self.first(audio)
         audio = self.second(audio)
         return audio
 
-
-transform = transforms.MelSpectrogram(
-    sample_rate=22050,
-    n_mels=64
-)
-
+sample_rate = 22050
+n_mels = 32
 max_len = 500
 
-# classes = ['airplane', 'breathing', 'brushing_teeth', 'can_opening', 'car_horn', 'cat', 'chainsaw', 'chirping_birds',
-#             'church_bells', 'clapping', 'clock_alarm', 'clock_tick', 'coughing', 'cow', 'crackling_fire', 'crickets', 'crow',
-#             'crying_baby', 'dog', 'door_wood_creaks', 'door_wood_knock', 'drinking_sipping', 'engine', 'fireworks', 'footsteps',
-#             'frog', 'glass_breaking', 'hand_saw', 'helicopter', 'hen', 'insects', 'keyboard_typing', 'laughing', 'mouse_click',
-#             'pig', 'pouring_water', 'rain', 'rooster', 'sea_waves', 'sheep', 'siren', 'sneezing', 'snoring', 'thunderstorm',
-#             'toilet_flush', 'train', 'vacuum_cleaner', 'washing_machine', 'water_drops', 'wind']
+transform = nn.Sequential(
+    transforms.MelSpectrogram(sample_rate=sample_rate, n_mels=n_mels),
+    transforms.AmplitudeToDB()
+)
 
-audio_app = FastAPI(title='Environment sounds')
-model = SimpleCNN()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-classes = torch.load('labels_environmental_sound_classification_50.pth', weights_only=False)
-model.load_state_dict(torch.load('model_environmental_sound_classification_50.pth', map_location=device))
-model.to(device)
+
+model = SimpleCNN().to(device)
+model.load_state_dict(torch.load(
+    'model_EnvironmentalSoundClassification_50.pth',
+    map_location=device
+))
 model.eval()
+
+classes = torch.load(
+    'labels_EnvironmentalSoundClassification_50.pth',
+    map_location='cpu',
+    weights_only=False
+)
+
+if isinstance(classes, torch.Tensor):
+    classes = classes.tolist()
+elif isinstance(classes, dict):
+    classes = list(classes.values())
+
+print(f"Модель загружена. Классов: {len(classes)}")
 
 
 def change_audio(waveform, sr):
-    if not isinstance(waveform, torch.Tensor):
-        waveform = torch.from_numpy(waveform.T).float()  # (channels, samples)
+    if isinstance(waveform, np.ndarray):
+        waveform = torch.from_numpy(waveform).float()
 
     if waveform.ndim == 1:
         waveform = waveform.unsqueeze(0)
     elif waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
 
-    if sr != 22050:
-        resample = transforms.Resample(orig_freq=sr, new_freq=22050)
+    if sr != sample_rate:
+        resample = transforms.Resample(orig_freq=sr, new_freq=sample_rate)
         waveform = resample(waveform)
 
     spec = transform(waveform)
 
+    if spec.dim() == 3 and spec.shape[0] == 1:
+        spec = spec.squeeze(0)
+
     if spec.shape[-1] > max_len:
         spec = spec[..., :max_len]
-    if spec.shape[-1] < max_len:
+    elif spec.shape[-1] < max_len:
         spec = F.pad(spec, (0, max_len - spec.shape[-1]))
 
-    return spec
+    return spec.unsqueeze(0).to(device)
+
+
+audio_app = FastAPI(title='Environment sounds')
 
 @audio_app.post('/predict/')
 async def predict_audio(file: UploadFile = File(...)):
@@ -89,17 +104,20 @@ async def predict_audio(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail='File not found')
 
         wf, sr = sf.read(io.BytesIO(data), dtype='float32')
-        wf = torch.from_numpy(wf).T if not isinstance(wf, torch.Tensor) else wf
 
         spec = change_audio(wf, sr)
-        spec = spec.unsqueeze(0).to(device)
 
         with torch.no_grad():
             y_pred = model(spec)
             pred_ind = torch.argmax(y_pred, dim=1).item()
             pred_class = classes[pred_ind]
+            confidence = torch.softmax(y_pred, dim=1)[0][pred_ind].item()
 
-        return {f'Index: {pred_ind}, Sound type: {pred_class}'}
+        return {
+            "index": pred_ind,
+            "sound_type": pred_class,
+            "confidence": round(confidence * 100, 2)
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -123,17 +141,17 @@ if __name__ == '__main__':
 #             data = file.read()
 #
 #             wf, sr = sf.read(io.BytesIO(data), dtype='float32')
-#             wf = torch.from_numpy(wf.T).float()  # ← исправлено
 #
 #             spec = change_audio(wf, sr)
-#             spec = spec.unsqueeze(0).to(device)
 #
 #             with torch.no_grad():
 #                 y_pred = model(spec)
 #                 pred_ind = torch.argmax(y_pred, dim=1).item()
 #                 pred_class = classes[pred_ind]
+#                 confidence = torch.softmax(y_pred, dim=1)[0][pred_ind].item()
 #
 #             st.success(f'Index: {pred_ind}, Sound type: {pred_class}')
+#             st.info(f'Confidence: {confidence:.1%}')
 #
 #         except Exception as e:
 #             st.warning(f'Error: {e}')
